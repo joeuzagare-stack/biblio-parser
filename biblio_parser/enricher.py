@@ -27,9 +27,12 @@ class MetadataEnricher:
         elif reference.title:
             cache_key = f"title_{reference.title.value}"
             
-        if cache_key and cache_key in self.cache:
-            logger.debug(f"Cache hit for {cache_key}")
-            return self._apply_crossref_data(reference, self.cache[cache_key])
+        # Use .get() to prevent async KeyErrors during highly concurrent cloud execution
+        if cache_key:
+            cached_data = self.cache.get(cache_key)
+            if cached_data is not None:
+                logger.debug(f"Cache hit for {cache_key}")
+                return self._apply_crossref_data(reference, cached_data)
 
         async with self.semaphore:
             try:
