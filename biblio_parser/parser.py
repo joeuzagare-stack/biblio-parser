@@ -33,7 +33,9 @@ class DocumentReader:
         
         for page in doc:
             blocks = page.get_text("blocks")
-            blocks.sort(key=lambda b: (b[1], b[0])) 
+            
+            # b[0] is the X-coordinate. We divide by 250px to bucket the left and right columns!
+            blocks.sort(key=lambda b: (b[0] // 250, b[1])) 
             
             for b in blocks:
                 text = b[4].strip()
@@ -97,26 +99,14 @@ class ReferenceParser:
         current_ref = []
         
         # Matches [1], (1), 1., 1), 1 (with space), or bullet points
-        start_pattern = re.compile(r'^(?:\[\d+\]|\(\d+\)|\d+\.|\d+\)|\d+\s+(?=[A-Z])|\•|\*)')
-        
-        expected_num = 1
-        is_numbered_list = False
+        start_pattern = re.compile(r'^\s*(?:\[\d+\]|\(\d+\)|\d+\.|\d+\)|\d+\s+(?=[A-Z])|\•|\*)')
         
         for line in raw_lines:
             match = start_pattern.match(line)
             is_start = False
             
             if match:
-                num_match = re.search(r'\d+', match.group(0))
-                if num_match:
-                    num = int(num_match.group())
-                    # Highly lenient sequential tracker (allows skips up to 10 numbers to survive OCR drops)
-                    if expected_num - 2 <= num <= expected_num + 10 or (num <= 5 and not is_numbered_list):
-                        is_start = True
-                        expected_num = num + 1
-                        is_numbered_list = True
-                else:
-                    is_start = True # Bullet point
+                is_start = True # Any line starting with a number in the References section is safe
             else:
                 # Unnumbered lists heuristic (e.g., "Smith J, Brown P. (2020)...")
                 if len(line) > 10 and re.match(r'^[A-Z][a-z]+(?:,\s+[A-Z]\.)+(?:\s*&|\s+and)?', line) and not current_ref:
@@ -133,7 +123,7 @@ class ReferenceParser:
             references.append(" ".join(current_ref))
             
         # 4. Fallback for Giant Blobs (if newlines were destroyed by user clipboard)
-        if len(references) < 5 and len(text) > 1000:
+        if len(references) < 10 and len(text) > 1000:
             combined = " ".join(raw_lines)
             parts = re.split(r'(?=\s(?:\[\d+\]|\b\d+\.|\(\d+\))\s)', combined)
             if len(parts) > len(references):
