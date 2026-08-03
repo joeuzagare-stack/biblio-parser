@@ -1,15 +1,32 @@
 import re
 from typing import List
-import fitz  # PyMuPDF
-import docx
 from loguru import logger
 from .models import Reference, ParsedField, EntryType
 from .utils import normalize_whitespace, normalize_author
 
+# ---------------------------------------------------------
+# Graceful Imports for Production (Prevents Cloud Crashes)
+# ---------------------------------------------------------
+try:
+    import fitz  # PyMuPDF
+    PYMUPDF_AVAILABLE = True
+except ImportError as e:
+    logger.error(f"PyMuPDF import failed: {e}")
+    PYMUPDF_AVAILABLE = False
+
+try:
+    import docx
+    DOCX_AVAILABLE = True
+except ImportError as e:
+    logger.error(f"python-docx import failed: {e}")
+    DOCX_AVAILABLE = False
+
 class DocumentReader:
     @staticmethod
     def read_pdf(filepath: str) -> str:
-        """Reads a PDF, robustly detects 'References' block, and handles physical layout blocks."""
+        if not PYMUPDF_AVAILABLE:
+            raise RuntimeError("PDF parsing is disabled because the PyMuPDF library failed to load on this server.")
+        
         doc = fitz.open(filepath)
         lines = []
         found_refs = False
@@ -19,34 +36,32 @@ class DocumentReader:
             blocks.sort(key=lambda b: (b[1], b[0])) 
             
             for b in blocks:
-                block_text = b[4].strip()
-                if not block_text: continue
+                text = b[4].strip()
+                if not text: continue
                 
-                # Clean zero-width spaces immediately (fixes web/Google Docs paste bugs)
-                block_text = re.sub(r'[\u200b\u200e\u200f\u202a-\u202e\xa0]', ' ', block_text)
+                # Clean zero-width spaces immediately
+                text = re.sub(r'[\u200b\u200e\u200f\u202a-\u202e\xa0]', ' ', text)
                 
+                # Filter out publisher stamps, watermarks, and headers
+                if re.match(r'^(?:\[Page \d+\]|Made with Xodo|\d+,\s*0,\s*Downloaded from)', text, re.IGNORECASE):
+                    continue
+                
+                # Broad check for references section ("Works Cited", "References")
                 if not found_refs:
-                    # Check line by line inside the block to see if the heading is embedded
-                    block_lines = block_text.split('\n')
-                    for i, line in enumerate(block_lines):
-                        clean_line = line.strip()
-                        # Match "References", "Works Cited", "Bibliography", etc.
-                        if re.match(r'^\s*(?:\d+\.?\s*)?(?:References|Bibliography|Literature Cited|Works Cited)\s*$', clean_line, re.IGNORECASE):
-                            found_refs = True
-                            # Append the REST of this block (if any) as a single space-separated string
-                            remaining = " ".join(block_lines[i+1:]).strip()
-                            if remaining:
-                                lines.append(remaining)
-                            break
-                else:
-                    # We are inside the references section.
-                    # Replace newlines within the block with spaces to stitch sentences back together.
-                    lines.append(block_text.replace('\n', ' '))
+                    if re.search(r'^\s*(?:\d+\.?\s*)?(?:References|Bibliography|Literature Cited|Works Cited)\s*$', text, re.IGNORECASE):
+                        found_refs = True
+                        continue
+                
+                if found_refs or len(doc) <= 2:
+                    # Keep original structural newlines to prevent fusing separate references
+                    lines.append(text)
                     
-        return "\n".join(lines)
+        return "\n\n".join(lines)
 
     @staticmethod
     def read_docx(filepath: str) -> str:
+        if not DOCX_AVAILABLE:
+            raise RuntimeError("DOCX parsing is disabled because python-docx failed to load on this server.")
         doc = docx.Document(filepath)
         return "\n".join([para.text for para in doc.paragraphs])
         
@@ -57,90 +72,76 @@ class DocumentReader:
 
 class ReferenceParser:
     def __init__(self):
-        # Official Crossref regex logic
         self.doi_pattern = re.compile(r'(10\.\d{4,9}/[-._;()/:A-Za-z0-9]+)', re.IGNORECASE)
         self.year_pattern = re.compile(r'\b(19|20)\d{2}\b')
         self.url_pattern = re.compile(r'https?://\S+')
         self.pages_pattern = re.compile(r'\b(?:pp?\.?\s*)?(\d+)[-–](\d+)\b')
 
     def segment_references(self, text: str) -> List[str]:
-        """Multi-stage segmenter handling wrapped lines and various markers."""
-        # 1. Clean invisible characters
+        # 1. Clean invisible characters and common PDF artifacts
         text = re.sub(r'[\u200b\u200e\u200f\u202a-\u202e\xa0]', ' ', text)
-        raw_lines = text.split('\n')
         
-        # 2. Auto-truncate to reference section if a header is found (Fallback for TXT/DOCX)
-        ref_start_idx = 0
-        for i, line in enumerate(raw_lines):
-            clean_line = line.strip().lower()
-            if re.match(r'^\s*(?:\d+\.?\s*)?(?:references|bibliography|literature cited|works cited)\s*$', clean_line):
-                ref_start_idx = i + 1
-                break
-                
-        if ref_start_idx > 0 and (len(raw_lines) - ref_start_idx) > 2:
-            raw_lines = raw_lines[ref_start_idx:]
+        # 2. Aggressively strip rogue page headers and publisher footers inside the text blob
+        text = re.sub(r'(?im)^\[Page \d+\].*$', '', text)
+        text = re.sub(r'(?im)^\d+,\s*0,\s*Downloaded from.*$', '', text)
+        text = re.sub(r'(?im)^Made with Xodo.*$', '', text)
+        text = re.sub(r'(?im)^.*?WILEY\s+AJH.*?$', '', text)
+        text = re.sub(r'(?im)^RAJKUMAR$', '', text)
+        
+        # 3. Normalize multiple newlines
+        text = re.sub(r'\n{3,}', '\n\n', text)
 
-        # 3. Check for massive single-line blocks (pasted text with lost newlines)
-        combined_text = " ".join([line.strip() for line in raw_lines])
-        combined_text = re.sub(r'\s+', ' ', combined_text).strip()
+        raw_lines = [line.strip() for line in text.split('\n') if line.strip()]
         
-        # Look for numbers (1-3 digits) optionally followed by a period, that have a space after
-        marker_pattern = re.compile(r'(?:^|\s)(\[\d+\]|\(\d+\)|\b\d{1,3}\.?)(?=\s)')
-        matches = list(marker_pattern.finditer(combined_text))
-        
-        valid_matches = []
-        expected = 1
-        for match in matches:
-            num_str = re.sub(r'\D', '', match.group(1))
-            if num_str:
-                num = int(num_str)
-                # Ensure the number is strictly in an increasing sequence (allow gap of 1 or 2 for OCR errors)
-                if expected <= num <= expected + 2:
-                    valid_matches.append(match)
-                    expected = num + 1
-                    
         references = []
-        if len(valid_matches) >= 3:
-            # Slice the giant string at every validated sequence marker
-            last_idx = 0
-            for match in valid_matches:
-                start = match.start()
-                if start > last_idx:
-                    segment = combined_text[last_idx:start].strip()
-                    if segment:
-                        references.append(segment)
-                
-                marker_str = match.group(1)
-                marker_start = start + combined_text[start:match.end()].find(marker_str)
-                last_idx = marker_start
-                
-            if last_idx < len(combined_text):
-                references.append(combined_text[last_idx:].strip())
-                
-            if references and not re.match(r'^(\[\d+\]|\(\d+\)|\b\d{1,3}\.?)', references[0]):
-                references.pop(0)
-        else:
-            # Fallback to standard newline-based separation
-            lines = [line.strip() for line in raw_lines if line.strip()]
-            current_ref = []
-            # Start pattern: allow 1-3 digit numbers without dots (e.g. "1 Kawashima")
-            start_pattern = re.compile(r'^(\[\d+\]|\(\d+\)|\b\d{1,3}\.?|\d+\)|\•|\*|[A-Z][a-z]+(?:,\s+[A-Z]\.)+(?:\s*&|\s+and)?)(?:\s+|$)')
+        current_ref = []
+        
+        # Matches [1], (1), 1., 1), 1 (with space), or bullet points
+        start_pattern = re.compile(r'^(?:\[\d+\]|\(\d+\)|\d+\.|\d+\)|\d+\s+(?=[A-Z])|\•|\*)')
+        
+        expected_num = 1
+        is_numbered_list = False
+        
+        for line in raw_lines:
+            match = start_pattern.match(line)
+            is_start = False
             
-            for line in lines:
-                if start_pattern.match(line) or (len(line) > 50 and not current_ref):
-                    if current_ref:
-                        references.append(" ".join(current_ref))
-                    current_ref = [line]
+            if match:
+                num_match = re.search(r'\d+', match.group(0))
+                if num_match:
+                    num = int(num_match.group())
+                    # Highly lenient sequential tracker (allows skips up to 10 numbers to survive OCR drops)
+                    if expected_num - 2 <= num <= expected_num + 10 or (num <= 5 and not is_numbered_list):
+                        is_start = True
+                        expected_num = num + 1
+                        is_numbered_list = True
                 else:
-                    current_ref.append(line)
+                    is_start = True # Bullet point
+            else:
+                # Unnumbered lists heuristic (e.g., "Smith J, Brown P. (2020)...")
+                if len(line) > 10 and re.match(r'^[A-Z][a-z]+(?:,\s+[A-Z]\.)+(?:\s*&|\s+and)?', line) and not current_ref:
+                    is_start = True
                     
-            if current_ref:
-                references.append(" ".join(current_ref))
+            if is_start or (len(line) > 60 and not current_ref):
+                if current_ref:
+                    references.append(" ".join(current_ref))
+                current_ref = [line]
+            else:
+                current_ref.append(line)
                 
-        return [normalize_whitespace(ref) for ref in references if len(ref) > 10]
+        if current_ref:
+            references.append(" ".join(current_ref))
+            
+        # 4. Fallback for Giant Blobs (if newlines were destroyed by user clipboard)
+        if len(references) < 5 and len(text) > 1000:
+            combined = " ".join(raw_lines)
+            parts = re.split(r'(?=\s(?:\[\d+\]|\b\d+\.|\(\d+\))\s)', combined)
+            if len(parts) > len(references):
+                references = parts
+                
+        return [normalize_whitespace(ref) for ref in references if len(ref) > 15]
 
     def parse(self, raw_text: str) -> Reference:
-        """Heuristic-based reference parser (No generic NLP)."""
         ref = Reference(raw_text=raw_text)
         text = raw_text
 
@@ -163,33 +164,38 @@ class ReferenceParser:
         year_match = self.year_pattern.search(text)
         if year_match:
             ref.year = ParsedField(value=year_match.group(0), confidence=0.9)
+            text = text.replace(year_match.group(0), "") # Remove year from text
 
         # 4. Pages Extraction
         pages_match = self.pages_pattern.search(text)
         if pages_match:
             ref.pages = ParsedField(value=f"{pages_match.group(1)}--{pages_match.group(2)}", confidence=0.85)
+            text = text.replace(pages_match.group(0), "") # Remove pages from text
 
-        # 5. Clean starting markers (1. / [1] / 1 / etc.)
-        clean_text = re.sub(r'^\s*(\[\d+\]|\(\d+\)|\b\d{1,3}\.?|\•|\*)\s*', '', text).strip()
+        # 5. Clean starting markers
+        clean_text = re.sub(r'^\s*(\[\d+\]|\(\d+\)|\d+\.|\d+\)|\d+\s+(?=[A-Z])|\•|\*)\s*', '', text).strip()
         
-        # 6. Split by period to separate authors, title, journal
+        # 6. Universal Sentence Boundary Segmentation (Works for AMA, MLA, and APA)
         parts = [p.strip() for p in re.split(r'\.\s+', clean_text) if p.strip()]
         
         if len(parts) >= 2:
             part0 = parts[0]
-            if "et al" in part0.lower() or "," in part0:
+            # Authors typically have commas, "et al", or are short phrases
+            if "et al" in part0.lower() or "," in part0 or len(part0.split()) <= 6:
                 authors_raw = re.split(r'[,&]| and ', part0)
                 ref.authors = [normalize_author(a) for a in authors_raw if len(a) > 3]
                 
+                # Handle APA formatting where year is in parentheses after authors
                 title_idx = 1
                 if len(parts) > title_idx and re.match(r'^\(?\d{4}\)?$', parts[title_idx]):
-                    title_idx += 1 # Skip year if it's sitting between Author and Title (APA)
+                    title_idx += 1
                     
                 if len(parts) > title_idx:
-                    ref.title = ParsedField(value=parts[title_idx], confidence=0.7)
+                    ref.title = ParsedField(value=parts[title_idx], confidence=0.8)
                 if len(parts) > title_idx + 1:
-                    ref.journal = ParsedField(value=parts[title_idx + 1], confidence=0.6)
+                    ref.journal = ParsedField(value=parts[title_idx + 1], confidence=0.7)
             else:
+                # First part might be a Title if no authors present
                 ref.title = ParsedField(value=part0, confidence=0.6)
                 if len(parts) > 1:
                     ref.journal = ParsedField(value=parts[1], confidence=0.5)
