@@ -76,7 +76,7 @@ def process_and_display(text_or_path, is_file=False):
     )
 
 with tab1:
-    uploaded_file = st.file_uploader("Upload Bibliography (PDF, DOCX, TXT)", type=["pdf", "docx", "txt"])
+    uploaded_file = st.file_uploader("Upload Bibliography (PDF, DOCX, TXT, CSV)", type=["pdf", "docx", "txt", "csv"])
     if uploaded_file is not None:
         with tempfile.NamedTemporaryFile(delete=False, suffix="." + uploaded_file.name.split('.')[-1]) as tmp:
             tmp.write(uploaded_file.getvalue())

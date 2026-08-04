@@ -24,6 +24,8 @@ class BibliographyPipeline:
             text = DocumentReader.read_docx(filepath)
         elif ext == '.txt':
             text = DocumentReader.read_txt(filepath)
+        elif ext == '.csv':
+            text = DocumentReader.read_csv(filepath)
         else:
             raise ValueError(f"Unsupported file format: {ext}")
 
