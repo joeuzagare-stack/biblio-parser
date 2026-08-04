@@ -21,7 +21,7 @@ except ImportError as e:
 class DocumentReader:
     @staticmethod
     def read_pdf(filepath: str) -> str:
-        """Reads a PDF, gracefully handling 1, 2, and 3 column layouts and missing headers."""
+        """Reads a PDF, gracefully handling fused blocks, multi-column layouts and missing headers."""
         if not PYMUPDF_AVAILABLE:
             raise RuntimeError("PDF parsing is disabled because the PyMuPDF library failed to load.")
         
@@ -44,25 +44,32 @@ class DocumentReader:
                 text = re.sub(r'[\u200b\u200e\u200f\u202a-\u202e\xa0]', ' ', text)
                 
                 # Filter out publisher stamps, watermarks, and headers
-                if re.search(r'^(?:\[Page \d+\]|Made with Xodo|\d+,\s*0,\s*Downloaded from|.*WILEY\s+AJH.*|Springer Nature|www\.nature\.com|SEPTEMBER \d+ VOLUME)', text, re.IGNORECASE):
+                if re.search(r'^(?:\[Page \d+\]|Made with Xodo|.*WILEY\s+AJH.*|Springer Nature|www\.nature\.com|SEPTEMBER \d+ VOLUME)', text, re.IGNORECASE):
                     continue
                 if re.match(r'^\d+\s+[A-Z]+\s+\d+\s+VOLUME\s+\d+$', text, re.IGNORECASE):
                     continue
                 
                 if not found_refs:
-                    # 1. Standard Header Detection
-                    if re.search(r'^\s*(?:\d+\.?\s*)?(?:References|Bibliography|Literature Cited|Works Cited)\s*$', text, re.IGNORECASE):
-                        found_refs = True
-                        continue
-                    
-                    # 2. Fallback: If we are in the last 40% of the document and see an obvious citation
-                    if page_num >= len(doc) * 0.60:
-                        # Matches exact starts like "1." or "[1]" or obvious Author Name strings "1. Ribas, A."
-                        if re.match(r'^\s*(?:\[1\]|1\.)\s*[A-Z]', text) or \
-                           re.match(r'^\s*(?:\[\d+\]|\d+\.)\s+(?:[A-Z][a-z]+,\s+[A-Z]|[A-Z]\.\s+[A-Z][a-z]+)', text):
+                    block_lines = text.split('\n')
+                    for i, line in enumerate(block_lines):
+                        clean_line = line.strip()
+                        if not clean_line: continue
+                        
+                        # 1. Standard Header Detection inside the block
+                        if re.search(r'^\s*(?:\d+\.?\s*)?(?:References|Bibliography|Literature Cited|Works Cited)\s*$', clean_line, re.IGNORECASE):
                             found_refs = True
-                
-                if found_refs or len(doc) <= 2:
+                            lines.append("\n".join(block_lines[i+1:])) # Append everything AFTER the header
+                            break
+                        
+                        # 2. Fallback: If we are in the last 50% of the document and see an obvious citation
+                        if page_num >= len(doc) * 0.50:
+                            # Matches exact starts like "1. Author" or "[1] Author"
+                            if re.match(r'^\s*(?:\[1\]|1\.)\s*[A-Z]', clean_line) or \
+                               re.match(r'^\s*(?:\[\d{1,4}\]|\d{1,4}\.)\s+(?:[A-Z][a-z]+,\s+[A-Z]|[A-Z]\.\s+[A-Z][a-z]+)', clean_line):
+                                found_refs = True
+                                lines.append("\n".join(block_lines[i:])) # Append from the citation downwards
+                                break
+                else:
                     # Keep original structural newlines to prevent fusing separate references
                     lines.append(text)
                     
@@ -98,8 +105,8 @@ class ReferenceParser:
         references = []
         current_ref = []
         
-        # Matches [1], (1), 1., 1), 1 (with space), or bullet points
-        start_pattern = re.compile(r'^\s*(?:\[\d+\]|\(\d+\)|\d+\.|\d+\)|\d+\s+(?=[A-Z])|\•|\*)')
+        # Matches [1], (1), 1., 1), 1 (with space), or bullet points (capped at 4 digits to prevent matching years)
+        start_pattern = re.compile(r'^\s*(?:\[\d{1,4}\]|\(\d{1,4}\)|\b\d{1,4}\.|\b\d{1,4}\)|\b\d{1,4}\s+(?=[A-Z])|\•|\*)')
         
         for line in raw_lines:
             match = start_pattern.match(line)
@@ -125,7 +132,7 @@ class ReferenceParser:
         # Fallback for Giant Blobs (if newlines were destroyed by user clipboard)
         if len(references) < 10 and len(text) > 1000:
             combined = " ".join(raw_lines)
-            parts = re.split(r'(?=\s(?:\[\d+\]|\b\d+\.|\(\d+\))\s)', combined)
+            parts = re.split(r'(?=\s(?:\[\d{1,4}\]|\b\d{1,4}\.|\(\d{1,4}\))\s)', combined)
             if len(parts) > len(references):
                 references = parts
                 
@@ -163,7 +170,7 @@ class ReferenceParser:
             text = text.replace(pages_match.group(0), "")
 
         # 5. Clean starting markers
-        clean_text = re.sub(r'^\s*(\[\d+\]|\(\d+\)|\d+\.|\d+\)|\d+\s+(?=[A-Z])|\•|\*)\s*', '', text).strip()
+        clean_text = re.sub(r'^\s*(?:\[\d{1,4}\]|\(\d{1,4}\)|\b\d{1,4}\.|\b\d{1,4}\)|\b\d{1,4}\s+(?=[A-Z])|\•|\*)\s*', '', text).strip()
         
         # 6. Smart Word Grouping (Protects Author initials like "J. D." from shattering)
         parts = []
