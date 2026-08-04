@@ -4,9 +4,6 @@ from loguru import logger
 from .models import Reference, ParsedField, EntryType
 from .utils import normalize_whitespace, normalize_author
 
-# ---------------------------------------------------------
-# Graceful Imports for Production (Prevents Cloud Crashes)
-# ---------------------------------------------------------
 try:
     import fitz  # PyMuPDF
     PYMUPDF_AVAILABLE = True
@@ -24,35 +21,46 @@ except ImportError as e:
 class DocumentReader:
     @staticmethod
     def read_pdf(filepath: str) -> str:
+        """Reads a PDF, gracefully handling 1, 2, and 3 column layouts and missing headers."""
         if not PYMUPDF_AVAILABLE:
-            raise RuntimeError("PDF parsing is disabled because the PyMuPDF library failed to load on this server.")
+            raise RuntimeError("PDF parsing is disabled because the PyMuPDF library failed to load.")
         
         doc = fitz.open(filepath)
         lines = []
         found_refs = False
         
-        for page in doc:
+        for page_num, page in enumerate(doc):
             blocks = page.get_text("blocks")
             
-            # b[0] is the X-coordinate. We divide by 250px to bucket the left and right columns!
-            blocks.sort(key=lambda b: (b[0] // 250, b[1])) 
+            # Using 150px buckets. This safely handles 1, 2, 3, and 4 column layouts 
+            # by grouping blocks horizontally before sorting them vertically.
+            blocks.sort(key=lambda b: (b[0] // 150, b[1])) 
             
             for b in blocks:
                 text = b[4].strip()
                 if not text: continue
                 
-                # Clean zero-width spaces immediately
+                # Strip zero-width spaces that break regex
                 text = re.sub(r'[\u200b\u200e\u200f\u202a-\u202e\xa0]', ' ', text)
                 
                 # Filter out publisher stamps, watermarks, and headers
-                if re.match(r'^(?:\[Page \d+\]|Made with Xodo|\d+,\s*0,\s*Downloaded from)', text, re.IGNORECASE):
+                if re.search(r'^(?:\[Page \d+\]|Made with Xodo|\d+,\s*0,\s*Downloaded from|.*WILEY\s+AJH.*|Springer Nature|www\.nature\.com|SEPTEMBER \d+ VOLUME)', text, re.IGNORECASE):
+                    continue
+                if re.match(r'^\d+\s+[A-Z]+\s+\d+\s+VOLUME\s+\d+$', text, re.IGNORECASE):
                     continue
                 
-                # Broad check for references section ("Works Cited", "References")
                 if not found_refs:
+                    # 1. Standard Header Detection
                     if re.search(r'^\s*(?:\d+\.?\s*)?(?:References|Bibliography|Literature Cited|Works Cited)\s*$', text, re.IGNORECASE):
                         found_refs = True
                         continue
+                    
+                    # 2. Fallback: If we are in the last 40% of the document and see an obvious citation
+                    if page_num >= len(doc) * 0.60:
+                        # Matches exact starts like "1." or "[1]" or obvious Author Name strings "1. Ribas, A."
+                        if re.match(r'^\s*(?:\[1\]|1\.)\s*[A-Z]', text) or \
+                           re.match(r'^\s*(?:\[\d+\]|\d+\.)\s+(?:[A-Z][a-z]+,\s+[A-Z]|[A-Z]\.\s+[A-Z][a-z]+)', text):
+                            found_refs = True
                 
                 if found_refs or len(doc) <= 2:
                     # Keep original structural newlines to prevent fusing separate references
@@ -63,7 +71,7 @@ class DocumentReader:
     @staticmethod
     def read_docx(filepath: str) -> str:
         if not DOCX_AVAILABLE:
-            raise RuntimeError("DOCX parsing is disabled because python-docx failed to load on this server.")
+            raise RuntimeError("DOCX parsing is disabled because python-docx failed to load.")
         doc = docx.Document(filepath)
         return "\n".join([para.text for para in doc.paragraphs])
         
@@ -80,19 +88,11 @@ class ReferenceParser:
         self.pages_pattern = re.compile(r'\b(?:pp?\.?\s*)?(\d+)[-–](\d+)\b')
 
     def segment_references(self, text: str) -> List[str]:
-        # 1. Clean invisible characters and common PDF artifacts
+        # Clean invisible characters
         text = re.sub(r'[\u200b\u200e\u200f\u202a-\u202e\xa0]', ' ', text)
         
-        # 2. Aggressively strip rogue page headers and publisher footers inside the text blob
-        text = re.sub(r'(?im)^\[Page \d+\].*$', '', text)
-        text = re.sub(r'(?im)^\d+,\s*0,\s*Downloaded from.*$', '', text)
-        text = re.sub(r'(?im)^Made with Xodo.*$', '', text)
-        text = re.sub(r'(?im)^.*?WILEY\s+AJH.*?$', '', text)
-        text = re.sub(r'(?im)^RAJKUMAR$', '', text)
-        
-        # 3. Normalize multiple newlines
+        # Normalize multiple newlines
         text = re.sub(r'\n{3,}', '\n\n', text)
-
         raw_lines = [line.strip() for line in text.split('\n') if line.strip()]
         
         references = []
@@ -106,9 +106,9 @@ class ReferenceParser:
             is_start = False
             
             if match:
-                is_start = True # Any line starting with a number in the References section is safe
+                is_start = True
             else:
-                # Unnumbered lists heuristic (e.g., "Smith J, Brown P. (2020)...")
+                # Unnumbered lists heuristic
                 if len(line) > 10 and re.match(r'^[A-Z][a-z]+(?:,\s+[A-Z]\.)+(?:\s*&|\s+and)?', line) and not current_ref:
                     is_start = True
                     
@@ -122,7 +122,7 @@ class ReferenceParser:
         if current_ref:
             references.append(" ".join(current_ref))
             
-        # 4. Fallback for Giant Blobs (if newlines were destroyed by user clipboard)
+        # Fallback for Giant Blobs (if newlines were destroyed by user clipboard)
         if len(references) < 10 and len(text) > 1000:
             combined = " ".join(raw_lines)
             parts = re.split(r'(?=\s(?:\[\d+\]|\b\d+\.|\(\d+\))\s)', combined)
@@ -154,42 +154,40 @@ class ReferenceParser:
         year_match = self.year_pattern.search(text)
         if year_match:
             ref.year = ParsedField(value=year_match.group(0), confidence=0.9)
-            text = text.replace(year_match.group(0), "") # Remove year from text
+            text = text.replace(year_match.group(0), "")
 
         # 4. Pages Extraction
         pages_match = self.pages_pattern.search(text)
         if pages_match:
             ref.pages = ParsedField(value=f"{pages_match.group(1)}--{pages_match.group(2)}", confidence=0.85)
-            text = text.replace(pages_match.group(0), "") # Remove pages from text
+            text = text.replace(pages_match.group(0), "")
 
         # 5. Clean starting markers
         clean_text = re.sub(r'^\s*(\[\d+\]|\(\d+\)|\d+\.|\d+\)|\d+\s+(?=[A-Z])|\•|\*)\s*', '', text).strip()
         
-        # 6. Universal Sentence Boundary Segmentation (Works for AMA, MLA, and APA)
-        parts = [p.strip() for p in re.split(r'\.\s+', clean_text) if p.strip()]
-        
-        if len(parts) >= 2:
-            part0 = parts[0]
-            # Authors typically have commas, "et al", or are short phrases
-            if "et al" in part0.lower() or "," in part0 or len(part0.split()) <= 6:
-                authors_raw = re.split(r'[,&]| and ', part0)
-                ref.authors = [normalize_author(a) for a in authors_raw if len(a) > 3]
+        # 6. Smart Word Grouping (Protects Author initials like "J. D." from shattering)
+        parts = []
+        current_part = []
+        for word in clean_text.split():
+            current_part.append(word)
+            if word.endswith('.'):
+                clean_word = word.strip('.,()')
+                # If it's a single uppercase letter, it's an initial. Don't split the sentence yet!
+                if len(clean_word) == 1 and clean_word.isupper():
+                    continue 
                 
-                # Handle APA formatting where year is in parentheses after authors
-                title_idx = 1
-                if len(parts) > title_idx and re.match(r'^\(?\d{4}\)?$', parts[title_idx]):
-                    title_idx += 1
-                    
-                if len(parts) > title_idx:
-                    ref.title = ParsedField(value=parts[title_idx], confidence=0.8)
-                if len(parts) > title_idx + 1:
-                    ref.journal = ParsedField(value=parts[title_idx + 1], confidence=0.7)
-            else:
-                # First part might be a Title if no authors present
-                ref.title = ParsedField(value=part0, confidence=0.6)
-                if len(parts) > 1:
-                    ref.journal = ParsedField(value=parts[1], confidence=0.5)
-        elif len(parts) == 1:
-            ref.title = ParsedField(value=parts[0], confidence=0.5)
+                parts.append(" ".join(current_part))
+                current_part = []
+                
+        if current_part:
+            parts.append(" ".join(current_part))
+            
+        parts = [p.strip(' .') for p in parts if p.strip(' .')]
+        
+        # Group Authors + Title into a single robust query string for Crossref
+        if len(parts) >= 1:
+            ref.title = ParsedField(value=parts[0], confidence=0.8)
+        if len(parts) >= 2:
+            ref.journal = ParsedField(value=parts[1], confidence=0.7)
 
         return ref
